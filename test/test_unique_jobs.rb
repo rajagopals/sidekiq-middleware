@@ -62,9 +62,46 @@ class TestUniqueJobs < MiniTest::Unit::TestCase
 
     class UniqueScheduledWorker
       include Sidekiq::Worker
+
       sidekiq_options queue: :unique_scheduled_queue, unique: :all
 
       def perform(x)
+      end
+    end
+
+    describe "when the job requeues itself" do
+      before do
+        class UniqueScheduledWorker
+          include Sidekiq::Worker
+          # Turn off uniquness and the test below passes.
+          sidekiq_options queue: :unique_scheduled_queue, unique: :all
+
+          def perform(x)
+            self.class.perform_at(Time.now + 5000)
+          end
+        end
+      end
+
+      it "should process the job and enqueue itself again" do
+        # Queue the parent job
+        UniqueScheduledWorker.perform_at(Time.now)
+        assert_equal 1, Sidekiq.redis { |c| c.zcard('schedule') }
+
+        # Make sure sidekiq pops the item off the scheduled queue
+        Sidekiq::Scheduled::Poller.new.poll
+        assert_equal 0, Sidekiq.redis { |c| c.zcard('schedule') }
+
+        # Process the message
+        msg = Sidekiq.dump_json('class' => UniqueScheduledWorker.to_s, 'queue' => 'unique_scheduled_queue', 'args' => ['args'])
+        actor = MiniTest::Mock.new
+        actor.expect(:processor_done, nil, [@processor])
+        actor.expect(:real_thread, nil, [nil, Celluloid::Thread])
+        2.times { @boss.expect(:async, actor, []) }
+        work = UnitOfWork.new('default', msg)
+        @processor.process(work)
+
+        # Expect the job to be requeued
+        assert_equal 1, Sidekiq.redis { |c| c.zcard('schedule') }
       end
     end
 
